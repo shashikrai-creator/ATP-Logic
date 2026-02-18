@@ -1,0 +1,250 @@
+/**
+ * Advanced ATP Engine: generateAndCompareFulfillmentSchedule
+ * Logic: Compares current vs. last-run inputs to identify root causes for 
+ * schedule changes (Supply Delays, RDD Slips, or Pre-empted by priority).
+ */
+function generateAndCompareFulfillmentSchedule() {
+  const SPREADSHEET = SpreadsheetApp.getActiveSpreadsheet();
+  const nowTimestamp = new Date();
+
+  // 1. GATHER ALL DATA
+  const currentSupply = getSheetData("TPU_Supply");
+  const currentRequests = getSheetData("TPU_Requests");
+  const oldScheduleData = getSheetData("Fulfillment_Schedule");
+  const lastRunSupply = getSheetData("Last_Run_Supply");
+  const lastRunRequests = getSheetData("Last_Run_Requests");
+
+  // 2. ANALYZE INPUT CHANGES (Root Cause Analysis)
+  let changedInputs = {
+    slippedSupplyTypes: new Set(),
+    newHighPriorityRequestIDs: new Set(),
+    requestDateSlips: new Map() // Request_ID -> {oldDate, newDate}
+  };
+
+  // Check for Supply Delays (Compared to Last Run)
+  let lastSupplyMap = new Map();
+  lastRunSupply.forEach(s => lastSupplyMap.set(s.Location + "|" + s.TPU_Type, s.Arrival_Date));
+  
+  currentSupply.forEach(s => {
+    let key = s.Location + "|" + s.TPU_Type;
+    if (lastSupplyMap.has(key) && new Date(s.Arrival_Date) > new Date(lastSupplyMap.get(key))) {
+      changedInputs.slippedSupplyTypes.add(s.TPU_Type);
+    }
+  });
+
+  // Check for Request Changes (RDD Slips or New High Priority)
+  let lastReqMap = new Map();
+  lastRunRequests.forEach(r => lastReqMap.set(r.Request_ID, r));
+
+  currentRequests.forEach(r => {
+    if (!lastReqMap.has(r.Request_ID)) {
+      if (r.Priority === "P0" || r.Priority === "P1") {
+        changedInputs.newHighPriorityRequestIDs.add(r.Request_ID);
+      }
+    } else {
+      let oldR = lastReqMap.get(r.Request_ID);
+      if (new Date(r.Requested_Delivery_Date) > new Date(oldR.Requested_Delivery_Date)) {
+        changedInputs.requestDateSlips.set(r.Request_ID, {
+          oldDate: new Date(oldR.Requested_Delivery_Date),
+          newDate: new Date(r.Requested_Delivery_Date)
+        });
+      }
+    }
+  });
+
+  // 3. GENERATE NEW PROPOSED SCHEDULE (Allocation Engine)
+  const planningMonths = getPlanningMonths(new Date(), 24);
+  const allTpuTypes = getUniqueTpuTypes(currentSupply, currentRequests);
+
+  let monthlyCumulativeSupply = {};
+  let monthlyConsumption = {};
+  for (const tpuType of allTpuTypes) {
+    monthlyCumulativeSupply[tpuType] = {};
+    monthlyConsumption[tpuType] = {};
+    planningMonths.forEach(m => {
+      monthlyCumulativeSupply[tpuType][m] = 0;
+      monthlyConsumption[tpuType][m] = 0;
+    });
+  }
+
+  planningMonths.forEach(month => {
+    currentSupply.forEach(entry => {
+      if (new Date(entry.Arrival_Date) <= new Date(month)) {
+        const key = entry.TPU_Type;
+        if (monthlyCumulativeSupply[key]) {
+          monthlyCumulativeSupply[key][month] += (entry.Quantity || 0);
+        }
+      }
+    });
+  });
+
+  let sortedRequests = currentRequests.sort((a, b) => {
+    const dateA = new Date(a.Requested_Delivery_Date);
+    const dateB = new Date(b.Requested_Delivery_Date);
+    if (dateA < dateB) return -1;
+    if (dateA > dateB) return 1;
+    if (a.Priority < b.Priority) return -1;
+    if (a.Priority > b.Priority) return 1;
+    return new Date(a.Order_Entry_Date) - new Date(b.Order_Entry_Date);
+  });
+
+  let newlyGeneratedSchedule = [];
+  for (const request of sortedRequests) {
+    let remainingQty = request.Quantity;
+    let resourceKey = request.TPU_Type;
+    let splitIdx = 0;
+
+    for (const month of planningMonths) {
+      if (new Date(month) < new Date(request.Requested_Delivery_Date)) continue;
+      if (remainingQty <= 0) break;
+
+      let remainingCap = (monthlyCumulativeSupply[resourceKey][month] || 0) - (monthlyConsumption[resourceKey][month] || 0);
+
+      if (remainingCap > 0) {
+        let allocated = Math.min(remainingQty, remainingCap);
+        let splitID = request.Request_ID + "-" + String.fromCharCode(65 + splitIdx);
+
+        newlyGeneratedSchedule.push({
+          Fulfillment_ID: splitID,
+          Original_Request_ID: request.Request_ID,
+          Product_Area: request.Product_Area,
+          Location: request.Location,
+          TPU_Type: request.TPU_Type,
+          Priority: request.Priority,
+          Fulfilled_Quantity: allocated,
+          Committed_Delivery_Date: month,
+          Status: "Committed"
+        });
+
+        monthlyConsumption[resourceKey][month] += allocated;
+        remainingQty -= allocated;
+        splitIdx++;
+      }
+    }
+
+    if (remainingQty > 0) {
+      newlyGeneratedSchedule.push({
+        Fulfillment_ID: request.Request_ID + "-" + String.fromCharCode(65 + splitIdx),
+        Original_Request_ID: request.Request_ID,
+        Product_Area: request.Product_Area,
+        Location: request.Location,
+        TPU_Type: request.TPU_Type,
+        Priority: request.Priority,
+        Fulfilled_Quantity: remainingQty,
+        Committed_Delivery_Date: "Capacity Exceeded",
+        Status: "On Hold"
+      });
+    }
+  }
+
+  // 4. COMPARE, ANALYZE, AND FINALIZE
+  let finalOutputData = [];
+  let oldScheduleMap = new Map();
+  oldScheduleData.forEach(row => { if (row.Fulfillment_ID) oldScheduleMap.set(row.Fulfillment_ID, row) });
+  let processedFulfillmentIDs = new Set();
+
+  for (const proposedLine of newlyGeneratedSchedule) {
+    let finalLine = { ...proposedLine, Last_Run_Timestamp: nowTimestamp };
+    const oldLine = oldScheduleMap.get(proposedLine.Fulfillment_ID);
+
+    if (oldLine && String(oldLine.Committed_Delivery_Date) !== String(proposedLine.Committed_Delivery_Date)) {
+      finalLine.Previous_Committed_Date = oldLine.Committed_Delivery_Date;
+      let changeReason = "Cascade from other changes"; 
+
+      const reqID = proposedLine.Original_Request_ID;
+      const tpuType = proposedLine.TPU_Type;
+
+      if (changedInputs.requestDateSlips.has(reqID)) {
+        changeReason = "Request's RDD Slipped";
+      } else if (changedInputs.slippedSupplyTypes.has(tpuType)) {
+        changeReason = "Supply Arrival Delayed";
+      } else if (changedInputs.newHighPriorityRequestIDs.size > 0) {
+        changeReason = "Pre-empted by New High-Priority Demand";
+      }
+
+      finalLine.Change_Reason = changeReason;
+      finalLine.Change_Flag = (new Date(proposedLine.Committed_Delivery_Date) > new Date(oldLine.Committed_Delivery_Date)) ? "► SLIP" : "◄ PULL-IN";
+      processedFulfillmentIDs.add(proposedLine.Fulfillment_ID);
+    } else if (!oldLine) {
+      finalLine.Change_Flag = "★ NEW";
+      finalLine.Change_Reason = "New fulfillment line created";
+    } else {
+      finalLine.Change_Flag = "✔ STABLE";
+      finalLine.Change_Reason = "";
+      processedFulfillmentIDs.add(proposedLine.Fulfillment_ID);
+    }
+    finalOutputData.push(finalLine);
+  }
+
+  // Handle CANCELLED lines
+  for (const [fulfillmentID, oldLine] of oldScheduleMap.entries()) {
+    if (!processedFulfillmentIDs.has(fulfillmentID)) {
+      let cancelledLine = { ...oldLine };
+      cancelledLine.Status = "CANCELLED";
+      cancelledLine.Change_Flag = "✖ CANCELLED";
+      cancelledLine.Change_Reason = "Request deleted from source";
+      cancelledLine.Last_Run_Timestamp = nowTimestamp;
+      finalOutputData.push(cancelledLine);
+    }
+  }
+
+  // 5. WRITE RESULTS & SNAPSHOT
+  writeResultsToSheet("Fulfillment_Schedule", finalOutputData);
+  copySheetData("TPU_Supply", "Last_Run_Supply");
+  copySheetData("TPU_Requests", "Last_Run_Requests");
+
+  SpreadsheetApp.getUi().alert("Fulfillment Schedule comparison and update complete.");
+}
+
+/** --- HELPER FUNCTIONS --- **/
+
+function getSheetData(name) {
+  const sheet = SpreadsheetApp.getActiveSpreadsheet().getSheetByName(name);
+  if (!sheet) return [];
+  const vals = sheet.getDataRange().getValues();
+  const headers = vals.shift();
+  return vals.map(r => {
+    let obj = {};
+    headers.forEach((h, i) => obj[h] = r[i]);
+    return obj;
+  });
+}
+
+function writeResultsToSheet(name, data) {
+  const sheet = SpreadsheetApp.getActiveSpreadsheet().getSheetByName(name);
+  if (!sheet) return;
+  sheet.clearContents();
+  const headers = ["Fulfillment_ID", "Original_Request_ID", "Product_Area", "Location", "TPU_Type", "Priority", "Fulfilled_Quantity", "Committed_Delivery_Date", "Status", "Previous_Committed_Date", "Change_Flag", "Change_Reason", "Last_Run_Timestamp"];
+  sheet.appendRow(headers);
+  if (data.length > 0) {
+    const rows = data.map(item => headers.map(h => item[h]));
+    sheet.getRange(2, 1, rows.length, headers.length).setValues(rows);
+  }
+}
+
+function copySheetData(sourceName, targetName) {
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  const source = ss.getSheetByName(sourceName);
+  const target = ss.getSheetByName(targetName);
+  if (source && target) {
+    target.clearContents();
+    const data = source.getDataRange().getValues();
+    target.getRange(1, 1, data.length, data[0].length).setValues(data);
+  }
+}
+
+function getPlanningMonths(start, count) {
+  let months = [];
+  let d = new Date(start.getFullYear(), start.getMonth(), 1);
+  for (let i = 0; i < count; i++) {
+    months.push(new Date(d.getFullYear(), d.getMonth() + i, 1).toDateString());
+  }
+  return months;
+}
+
+function getUniqueTpuTypes(supply, requests) {
+  let types = new Set();
+  supply.forEach(s => types.add(s.TPU_Type));
+  requests.forEach(r => types.add(r.TPU_Type));
+  return Array.from(types);
+}

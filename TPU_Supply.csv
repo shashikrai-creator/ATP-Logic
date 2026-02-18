@@ -1,0 +1,7 @@
+Supply_ID,TPU_Type,Supplier,Supply_Type,Quantity,Arrival_Date
+SUP-001,v5e,CM-Alpha,On-Hand,1536,01/01/2026
+SUP-002,v5e,CM-Alpha,On-Order,512,03/15/2026
+SUP-003,v5e,CM-Bravo,On-Order,512,04/01/2026
+SUP-004,v5e,CM-Alpha,On-Order,512,06/15/2026
+SUP-005,v4,CM-Alpha,On-Hand,2048,01/01/2026
+SUP-006,v4,CM-Bravo,On-Order,1024,08/01/2026

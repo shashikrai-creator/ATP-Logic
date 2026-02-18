@@ -1,0 +1,10 @@
+Request_ID,Product_Area,Location,TPU_Type,Quantity,Priority,Order_Entry_Date,Requested_Delivery_Date,Status,ATP_Date
+REQ-001,Search,us-central1,v5e,256,P0,01/15/2026,02/01/2026,,
+REQ-002,Search,us-central1,v5e,256,P0,01/15/2026,02/01/2026,,
+REQ-003,Ads,us-central1,v5e,512,P1,01/20/2026,03/01/2026,,
+REQ-004,Cloud,europe-west4,v5e,256,P0,02/01/2026,03/01/2026,,
+REQ-005,Cloud,europe-west4,v5e,128,P0,02/01/2026,03/01/2026,,
+REQ-006,Search,us-central1,v4,1024,P1,02/10/2026,04/01/2026,,
+REQ-007,Ads,us-central1,v5e,256,P1,02/15/2026,05/01/2026,,
+REQ-008,Ads,us-central1,v5e,256,P1,02/15/2026,06/01/2026,,
+REQ-009,Cloud,europe-west4,v5e,256,P2,02/20/2026,06/01/2026,,
